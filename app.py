@@ -126,57 +126,70 @@ def _firma_profesional(nombre):
     return path.read_bytes() if path.exists() else None
 
 def _overlay_cap(empresa, fecha, temas, asistentes, instructor):
-    """Crea SOLO los datos variables. El diseño sale del CAP.pdf original."""
+    """Crea únicamente la capa variable sobre el CAP.pdf original."""
     template = PdfReader(str(ROOT/'assets'/'CAP.pdf'))
     base_page = template.pages[0]
     W=float(base_page.mediabox.width); H=float(base_page.mediabox.height)
     b=io.BytesIO(); c=canvas.Canvas(b,pagesize=(W,H))
     c.setFillColorRGB(0,0,0)
-    # Fecha - casillero superior derecho
-    c.setFont('Helvetica',8.5); c.drawString(W-75,778,fecha)
-    # Datos empresa, sobre los renglones ya existentes de la plantilla
-    c.setFont('Helvetica-Bold',9.2)
-    c.drawString(78,698,str(empresa.get('razon_social',''))[:72])
-    c.drawString(42,676,str(empresa.get('cuit',''))[:28])
-    direccion=' '.join(x for x in [str(empresa.get('direccion','')).strip(), str(empresa.get('localidad','')).strip()] if x)
-    c.drawString(72,654,direccion[:78])
-    # Temáticas: la plantilla tiene 6 renglones útiles. Ajustamos tamaño si son largas.
-    y=608
+
+    # Coordenadas calibradas contra el CAP.pdf original A4 (595.2 x 841.92 pt).
+    # Fecha: a continuación de la palabra "Fecha:" sin tocar el encabezado.
     c.setFont('Helvetica',8.2)
+    c.drawString(523, 778, str(fecha))
+
+    # Datos de empresa: a la derecha de las etiquetas originales.
+    c.setFont('Helvetica',8.2)
+    c.drawString(112, 687, str(empresa.get('razon_social',''))[:70])
+    c.drawString(78, 667, str(empresa.get('cuit',''))[:30])
+    direccion=' - '.join(x for x in [str(empresa.get('direccion','')).strip(), str(empresa.get('localidad','')).strip()] if x)
+    c.drawString(120, 647, direccion[:78])
+
+    # Temáticas: el formulario original dispone de cinco renglones.
+    # Si hay más de cinco, se conservan todas agrupando el excedente en el último renglón.
+    temas_limpios=[str(t).strip() for t in temas if str(t).strip()]
     lineas=[]
-    for t in temas:
-        t=str(t).strip()
-        if not t: continue
-        # envolver sin alterar el contenido
-        words=t.split(); cur=''
-        for w in words:
-            test=(cur+' '+w).strip()
-            if len(test)>92 and cur:
-                lineas.append(cur); cur=w
-            else: cur=test
-        if cur: lineas.append(cur)
-    for line in lineas[:6]:
-        c.drawString(22,y,line); y-=17.3
-    # Asistentes. Posiciones calcadas de la tabla original (15 filas).
-    row_top=458; row_h=21.55
-    x_name=37; x_dni=242; x_puesto=330; x_firma=448
+    for t in temas_limpios:
+        if len(lineas)<4:
+            lineas.append(t)
+        else:
+            resto=' · '.join(temas_limpios[4:])
+            lineas.append(resto)
+            break
+    y=610
+    for line in lineas[:5]:
+        # Ajuste automático de fuente para que nunca salga del cuadro.
+        fs=8.0
+        while fs>6.0 and c.stringWidth(line,'Helvetica',fs)>505:
+            fs-=0.25
+        c.setFont('Helvetica',fs)
+        c.drawString(42,y,line)
+        y-=21.2
+
+    # Asistentes: primera fila útil debajo de los títulos; 15 filas del original.
+    row_top=456; row_h=21.55
+    x_name=40; x_dni=244; x_puesto=332; x_firma=455
     for i,a in enumerate(asistentes[:15]):
         cy=row_top-i*row_h
-        c.setFont('Helvetica',7.6)
-        c.drawString(x_name,cy,str(a.get('apellido_nombre',''))[:43])
+        c.setFont('Helvetica',7.3)
+        c.drawString(x_name,cy,str(a.get('apellido_nombre',''))[:42])
         c.drawString(x_dni,cy,str(a.get('dni',''))[:18])
-        c.drawString(x_puesto,cy,str(a.get('puesto',''))[:24])
+        c.drawString(x_puesto,cy,str(a.get('puesto',''))[:23])
         if a.get('firma'):
             try:
-                c.drawImage(ImageReader(io.BytesIO(a['firma'])),x_firma,cy-8,width=105,height=18,preserveAspectRatio=True,anchor='c',mask='auto')
-            except Exception: pass
-    # Firma del instructor: la leyenda y el pie SON de la plantilla; sólo estampamos la firma.
+                c.drawImage(ImageReader(io.BytesIO(a['firma'])),455,cy-7,width=92,height=16,preserveAspectRatio=True,anchor='c',mask='auto')
+            except Exception:
+                pass
+
+    # Firma profesional: por encima de la línea original, sin tapar la leyenda ni el pie.
     sig=_firma_profesional(instructor)
     if sig:
         try:
-            c.drawImage(ImageReader(io.BytesIO(sig)),220,103,width=160,height=34,preserveAspectRatio=True,anchor='c',mask='auto')
-        except Exception: pass
-    c.save(); return b.getvalue()
+            c.drawImage(ImageReader(io.BytesIO(sig)),215,118,width=175,height=34,preserveAspectRatio=True,anchor='c',mask='auto')
+        except Exception:
+            pass
+    c.save()
+    return b.getvalue()
 
 def pdf_cap(empresa,fecha,temas,asistentes,instructor,visado=None):
     template_path=ROOT/'assets'/'CAP.pdf'
