@@ -60,12 +60,47 @@ def exec1(sql,args=()):
 def empresa_options(): return q('SELECT * FROM empresas ORDER BY razon_social')
 def worker_options(eid): return q('SELECT * FROM trabajadores WHERE empresa_id=? ORDER BY apellido_nombre',(eid,))
 
+def _firma_desde_json(json_data, width=650, height=180):
+    # No usamos cv.image_data: esa propiedad falla actualmente en Streamlit Cloud/Python 3.14.
+    # Reconstruimos la firma desde los trazos vectoriales que devuelve el canvas.
+    if not json_data or not json_data.get('objects'):
+        return None
+    from PIL import ImageDraw
+    im = Image.new('RGB', (width, height), 'white')
+    draw = ImageDraw.Draw(im)
+    hay_trazo = False
+    for obj in json_data.get('objects', []):
+        if obj.get('type') != 'path':
+            continue
+        pts=[]
+        left=float(obj.get('left',0)); top=float(obj.get('top',0))
+        sx=float(obj.get('scaleX',1)); sy=float(obj.get('scaleY',1))
+        for cmd in obj.get('path', []):
+            if not cmd: continue
+            op=cmd[0]
+            nums=cmd[1:]
+            if op in ('M','L') and len(nums)>=2:
+                pts.append((left+float(nums[0])*sx, top+float(nums[1])*sy))
+            elif op=='Q' and len(nums)>=4:
+                pts.append((left+float(nums[2])*sx, top+float(nums[3])*sy))
+            elif op=='C' and len(nums)>=6:
+                pts.append((left+float(nums[4])*sx, top+float(nums[5])*sy))
+        if len(pts)>=2:
+            draw.line(pts, fill='black', width=max(2,int(float(obj.get('strokeWidth',3)))))
+            hay_trazo=True
+    if not hay_trazo:
+        return None
+    b=io.BytesIO(); im.save(b,format='PNG'); return b.getvalue()
+
 def firma_widget(key):
-    st.caption('Firma del trabajador con el dedo. Borrar permite rehacerla antes de guardar.')
+    st.caption('Firmá dentro del recuadro con el dedo o mouse. La firma se guarda al generar el registro.')
     if st_canvas:
         cv=st_canvas(fill_color='rgba(255,255,255,0)', stroke_width=3, stroke_color='#000000', background_color='#FFFFFF', height=180, width=650, drawing_mode='freedraw', key=key)
-        if cv.image_data is not None:
-            im=Image.fromarray(cv.image_data.astype('uint8'),'RGBA').convert('RGB'); b=io.BytesIO(); im.save(b,format='PNG'); return b.getvalue()
+        try:
+            return _firma_desde_json(cv.json_data,650,180)
+        except Exception as e:
+            st.warning(f'No pude procesar la firma todavía: {e}')
+            return None
     st.warning('El componente de firma no está disponible. Revisá requirements.txt.')
     return None
 
@@ -214,4 +249,4 @@ with hist:
 with emp:
     st.subheader('Empresas')
     df=pd.DataFrame([dict(x) for x in empresa_options()]);st.dataframe(df,use_container_width=True,hide_index=True)
-    st.caption('Podés reemplazar data/clientes.csv por una exportación de la base habitual de Gestión Administrativa. La app la importa automáticamente.')
+    st.caption('Base inicial sincronizada con Gestión Administrativa: 44 clientes migrados. Los clientes ocasionales de capacitación/EPP se mantienen separados.')
