@@ -120,40 +120,75 @@ def ensure_empresa(eid,d):
     if not d['razon_social'].strip(): raise ValueError('Falta Razón Social')
     return exec1('INSERT OR IGNORE INTO empresas(razon_social,cuit,direccion,localidad,tipo) VALUES(?,?,?,?,?)',(d['razon_social'].strip(),d['cuit'],d['direccion'],d['localidad'],d['tipo'])) or q('SELECT id FROM empresas WHERE razon_social=?',(d['razon_social'].strip(),))[0]['id']
 
-def draw_header(c,title,fecha):
-    W,H=landscape(A4); c.setLineWidth(1); c.rect(25,H-80,W-50,52)
-    c.setFont('Helvetica-Bold',20); c.drawString(40,H-52,'S&S GROUP'); c.setFont('Helvetica-Bold',16); c.drawCentredString(W/2,H-48,title)
-    c.setFont('Helvetica',9); c.drawCentredString(W/2,H-64,'Ley 19.587/72 · Decreto 351/79 / 911/96'); c.setFont('Helvetica-Bold',9); c.drawString(W-155,H-48,f'Fecha: {fecha}')
-    return W,H
+def _firma_profesional(nombre):
+    fn = 'firma_martin.png' if nombre.startswith('Martín') else 'firma_juan_ignacio.png'
+    path = ROOT/'assets'/fn
+    return path.read_bytes() if path.exists() else None
 
-def pdf_cap(empresa,fecha,temas,asistentes,visado=None):
-    b=io.BytesIO(); c=canvas.Canvas(b,pagesize=landscape(A4)); W,H=draw_header(c,'CONSTANCIA DE CAPACITACIÓN',fecha)
-    y=H-105;c.setFont('Helvetica-Bold',11);c.drawString(30,y,'EMPRESA:');c.setFont('Helvetica',11);c.drawString(95,y,empresa['razon_social']);c.setFont('Helvetica-Bold',11);c.drawString(470,y,'CUIT:');c.setFont('Helvetica',11);c.drawString(510,y,empresa.get('cuit',''))
-    y-=22;c.setFont('Helvetica-Bold',10);c.drawString(30,y,'DOMICILIO / LOCALIDAD:');c.setFont('Helvetica',10);c.drawString(160,y,f"{empresa.get('direccion','')} - {empresa.get('localidad','')} - {PROVINCIA}")
-    y-=25;c.setFont('Helvetica-Bold',11);c.drawString(30,y,'TEMÁTICAS BRINDADAS:');c.setFont('Helvetica',9)
-    for t in temas: y-=15;c.drawString(42,y,'• '+t[:115])
-    y-=22; x=[30,300,420,570,W-30]; rh=30;c.setFont('Helvetica-Bold',10);c.rect(x[0],y-rh,x[-1]-x[0],rh)
-    for xx in x[1:-1]:c.line(xx,y-rh,xx,y)
-    for i,h in enumerate(['APELLIDO Y NOMBRE','DNI / LEGAJO','PUESTO DE TRABAJO','FIRMA']):c.drawCentredString((x[i]+x[i+1])/2,y-19,h)
-    y-=rh
-    for a in asistentes:
-        if y<55:c.showPage(); W,H=draw_header(c,'CONSTANCIA DE CAPACITACIÓN',fecha); y=H-105
-        c.rect(x[0],y-rh,x[-1]-x[0],rh)
-        for xx in x[1:-1]:c.line(xx,y-rh,xx,y)
-        c.setFont('Helvetica',9);c.drawString(x[0]+5,y-19,a['apellido_nombre'][:42]);c.drawString(x[1]+5,y-19,a['dni']);c.drawString(x[2]+5,y-19,a['puesto'][:25])
+def _overlay_cap(empresa, fecha, temas, asistentes, instructor):
+    """Crea SOLO los datos variables. El diseño sale del CAP.pdf original."""
+    template = PdfReader(str(ROOT/'assets'/'CAP.pdf'))
+    base_page = template.pages[0]
+    W=float(base_page.mediabox.width); H=float(base_page.mediabox.height)
+    b=io.BytesIO(); c=canvas.Canvas(b,pagesize=(W,H))
+    c.setFillColorRGB(0,0,0)
+    # Fecha - casillero superior derecho
+    c.setFont('Helvetica',8.5); c.drawString(W-75,778,fecha)
+    # Datos empresa, sobre los renglones ya existentes de la plantilla
+    c.setFont('Helvetica-Bold',9.2)
+    c.drawString(78,698,str(empresa.get('razon_social',''))[:72])
+    c.drawString(42,676,str(empresa.get('cuit',''))[:28])
+    direccion=' '.join(x for x in [str(empresa.get('direccion','')).strip(), str(empresa.get('localidad','')).strip()] if x)
+    c.drawString(72,654,direccion[:78])
+    # Temáticas: la plantilla tiene 6 renglones útiles. Ajustamos tamaño si son largas.
+    y=608
+    c.setFont('Helvetica',8.2)
+    lineas=[]
+    for t in temas:
+        t=str(t).strip()
+        if not t: continue
+        # envolver sin alterar el contenido
+        words=t.split(); cur=''
+        for w in words:
+            test=(cur+' '+w).strip()
+            if len(test)>92 and cur:
+                lineas.append(cur); cur=w
+            else: cur=test
+        if cur: lineas.append(cur)
+    for line in lineas[:6]:
+        c.drawString(22,y,line); y-=17.3
+    # Asistentes. Posiciones calcadas de la tabla original (15 filas).
+    row_top=458; row_h=21.55
+    x_name=37; x_dni=242; x_puesto=330; x_firma=448
+    for i,a in enumerate(asistentes[:15]):
+        cy=row_top-i*row_h
+        c.setFont('Helvetica',7.6)
+        c.drawString(x_name,cy,str(a.get('apellido_nombre',''))[:43])
+        c.drawString(x_dni,cy,str(a.get('dni',''))[:18])
+        c.drawString(x_puesto,cy,str(a.get('puesto',''))[:24])
         if a.get('firma'):
-            try:c.drawImage(ImageReader(io.BytesIO(a['firma'])),x[3]+8,y-rh+3,width=x[4]-x[3]-16,height=rh-6,preserveAspectRatio=True,mask='auto')
-            except:pass
-        y-=rh
-    c.setFont('Helvetica-Bold',9);c.drawCentredString(W/2,25,'Firma de instructor por S&S Group'); c.save(); base=b.getvalue()
-    if visado:
-        out=PdfWriter();
-        for p in PdfReader(io.BytesIO(base)).pages:out.add_page(p)
+            try:
+                c.drawImage(ImageReader(io.BytesIO(a['firma'])),x_firma,cy-8,width=105,height=18,preserveAspectRatio=True,anchor='c',mask='auto')
+            except Exception: pass
+    # Firma del instructor: la leyenda y el pie SON de la plantilla; sólo estampamos la firma.
+    sig=_firma_profesional(instructor)
+    if sig:
         try:
-            for p in PdfReader(io.BytesIO(visado)).pages:out.add_page(p)
-        except:pass
-        bb=io.BytesIO();out.write(bb);return bb.getvalue()
-    return base
+            c.drawImage(ImageReader(io.BytesIO(sig)),220,103,width=160,height=34,preserveAspectRatio=True,anchor='c',mask='auto')
+        except Exception: pass
+    c.save(); return b.getvalue()
+
+def pdf_cap(empresa,fecha,temas,asistentes,instructor,visado=None):
+    template_path=ROOT/'assets'/'CAP.pdf'
+    if not template_path.exists(): raise FileNotFoundError('Falta assets/CAP.pdf')
+    tpl=PdfReader(str(template_path)); ov=PdfReader(io.BytesIO(_overlay_cap(empresa,fecha,temas,asistentes,instructor)))
+    page=tpl.pages[0]; page.merge_page(ov.pages[0])
+    out=PdfWriter(); out.add_page(page)
+    if visado:
+        try:
+            for p in PdfReader(io.BytesIO(visado)).pages: out.add_page(p)
+        except Exception: pass
+    bb=io.BytesIO(); out.write(bb); return bb.getvalue()
 
 def pdf_epp(empresa,trab,fecha,tarea,items,info=''):
     b=io.BytesIO();c=canvas.Canvas(b,pagesize=landscape(A4));W,H=landscape(A4);c.setFont('Helvetica-Bold',11);c.drawRightString(W-25,H-20,'Resolución 299/11, Anexo I');c.setFont('Helvetica-Bold',15);c.drawCentredString(W/2,H-40,'ENTREGA DE ROPA DE TRABAJO Y ELEMENTOS DE PROTECCIÓN PERSONAL')
@@ -182,6 +217,7 @@ cap,epp,hist,emp=st.tabs(['📋 Nueva capacitación','🦺 Entrega de EPP','🗂
 with cap:
     eid,ed=empresa_block('cap_'); fecha=st.date_input('Fecha',date.today(),key='cap_fecha')
     temas_df=pd.read_csv(DATA/'tematicas.csv'); opciones=temas_df['tematica'].tolist(); temas=st.multiselect('Temáticas brindadas',opciones,key='cap_temas'); manual=st.text_area('Otras temáticas (una por línea)',key='cap_manual')
+    instructor=st.selectbox('Instructor por S&S Group',['Martín Nicolás Sirvent','Juan Ignacio Sirvent'],key='cap_instructor')
     st.subheader('Asistentes')
     n=st.number_input('Cantidad de asistentes a cargar',1,30,1,key='nasis')
     asistentes=[]
@@ -199,7 +235,7 @@ with cap:
                     wid=old[0]['id']; exec1('UPDATE trabajadores SET apellido_nombre=?,puesto=?,firma=COALESCE(?,firma) WHERE id=?',(a['apellido_nombre'],a['puesto'],a['firma'],wid))
                 else:wid=exec1('INSERT INTO trabajadores(empresa_id,apellido_nombre,dni,puesto,firma) VALUES(?,?,?,?,?)',(eid,a['apellido_nombre'],a['dni'],a['puesto'],a['firma']))
                 aa=dict(a);aa['id']=wid;final.append(aa)
-            alltem=temas+[x.strip() for x in manual.splitlines() if x.strip()];vb=vis.getvalue() if vis else None;pdf=pdf_cap(empd,str(fecha.strftime('%d/%m/%Y')),alltem,final,vb)
+            alltem=temas+[x.strip() for x in manual.splitlines() if x.strip()];vb=vis.getvalue() if vis else None;pdf=pdf_cap(empd,str(fecha.strftime('%d/%m/%Y')),alltem,final,instructor,vb)
             cid=exec1('INSERT INTO capacitaciones(empresa_id,fecha,tematicas,visado,visado_nombre,pdf) VALUES(?,?,?,?,?,?)',(eid,str(fecha),'; '.join(alltem),vb,vis.name if vis else '',pdf))
             for a in final:exec1('INSERT INTO capacitacion_asistentes(capacitacion_id,trabajador_id) VALUES(?,?)',(cid,a['id']))
             st.success('Capacitación guardada.');st.download_button('⬇️ Descargar constancia PDF',pdf,f'capacitacion_{fecha}.pdf','application/pdf')
@@ -250,3 +286,21 @@ with emp:
     st.subheader('Empresas')
     df=pd.DataFrame([dict(x) for x in empresa_options()]);st.dataframe(df,use_container_width=True,hide_index=True)
     st.caption('Base inicial sincronizada con Gestión Administrativa: 44 clientes migrados. Los clientes ocasionales de capacitación/EPP se mantienen separados.')
+
+    st.markdown('---')
+    st.subheader('Firmas de instructores')
+    st.caption('Juan Ignacio ya tiene una firma inicial recuperada de documentación previa. Podés reemplazar cualquiera de las dos por un PNG/JPG recortado de la firma.')
+    for nombre,fn in [('Martín Nicolás Sirvent','firma_martin.png'),('Juan Ignacio Sirvent','firma_juan_ignacio.png')]:
+        path=ROOT/'assets'/fn
+        c1,c2=st.columns([2,1])
+        with c1:
+            st.write('**'+nombre+'**')
+            if path.exists():
+                st.image(str(path),width=260)
+            else:
+                st.warning('Firma todavía no cargada.')
+        with c2:
+            up=st.file_uploader('Cargar/reemplazar firma',type=['png','jpg','jpeg'],key='sig_'+fn)
+            if up is not None and st.button('Guardar firma',key='save_'+fn):
+                im=Image.open(up).convert('RGBA'); im.thumbnail((1400,500)); im.save(path,'PNG'); st.success('Firma guardada.'); st.rerun()
+
