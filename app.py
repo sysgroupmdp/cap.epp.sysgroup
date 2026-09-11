@@ -60,13 +60,34 @@ def exec1(sql,args=()):
 def empresa_options(): return q('SELECT * FROM empresas ORDER BY razon_social')
 def worker_options(eid): return q('SELECT * FROM trabajadores WHERE empresa_id=? ORDER BY apellido_nombre',(eid,))
 
+def _normalizar_firma_bytes(data, padding=10):
+    """Recorta márgenes blancos para que la firma sea visible al insertarla en PDF."""
+    if not data:
+        return None
+    try:
+        im=Image.open(io.BytesIO(data)).convert('RGBA')
+        # detectar píxeles oscuros (la firma) ignorando el fondo blanco/transparente
+        px=im.load(); xs=[]; ys=[]
+        for yy in range(im.height):
+            for xx in range(im.width):
+                r,g,b,a=px[xx,yy]
+                if a>20 and min(r,g,b)<235:
+                    xs.append(xx); ys.append(yy)
+        if not xs:
+            return None
+        box=(max(0,min(xs)-padding), max(0,min(ys)-padding), min(im.width,max(xs)+padding+1), min(im.height,max(ys)+padding+1))
+        im=im.crop(box)
+        out=io.BytesIO(); im.save(out,format='PNG'); return out.getvalue()
+    except Exception:
+        return data
+
 def _firma_desde_json(json_data, width=650, height=180):
     # No usamos cv.image_data: esa propiedad falla actualmente en Streamlit Cloud/Python 3.14.
     # Reconstruimos la firma desde los trazos vectoriales que devuelve el canvas.
     if not json_data or not json_data.get('objects'):
         return None
     from PIL import ImageDraw
-    im = Image.new('RGB', (width, height), 'white')
+    im = Image.new('RGBA', (width, height), (255,255,255,255))
     draw = ImageDraw.Draw(im)
     hay_trazo = False
     for obj in json_data.get('objects', []):
@@ -77,8 +98,7 @@ def _firma_desde_json(json_data, width=650, height=180):
         sx=float(obj.get('scaleX',1)); sy=float(obj.get('scaleY',1))
         for cmd in obj.get('path', []):
             if not cmd: continue
-            op=cmd[0]
-            nums=cmd[1:]
+            op=cmd[0]; nums=cmd[1:]
             if op in ('M','L') and len(nums)>=2:
                 pts.append((left+float(nums[0])*sx, top+float(nums[1])*sy))
             elif op=='Q' and len(nums)>=4:
@@ -90,7 +110,27 @@ def _firma_desde_json(json_data, width=650, height=180):
             hay_trazo=True
     if not hay_trazo:
         return None
-    b=io.BytesIO(); im.save(b,format='PNG'); return b.getvalue()
+    b=io.BytesIO(); im.save(b,format='PNG')
+    return _normalizar_firma_bytes(b.getvalue())
+
+def upsert_trabajador(empresa_id, apellido_nombre, dni='', puesto='', firma=None):
+    """Única alta/actualización de trabajador para Capacitación y EPP."""
+    nombre=(apellido_nombre or '').strip(); dni=(dni or '').strip(); puesto=(puesto or '').strip()
+    if not nombre:
+        raise ValueError('Falta nombre del trabajador')
+    firma=_normalizar_firma_bytes(firma) if firma else None
+    old=[]
+    if dni:
+        old=q('SELECT * FROM trabajadores WHERE empresa_id=? AND dni=?',(empresa_id,dni))
+    if not old:
+        old=q('SELECT * FROM trabajadores WHERE empresa_id=? AND UPPER(TRIM(apellido_nombre))=UPPER(TRIM(?))',(empresa_id,nombre))
+    if old:
+        wid=old[0]['id']
+        exec1('UPDATE trabajadores SET apellido_nombre=?, dni=CASE WHEN ?<>'' THEN ? ELSE dni END, puesto=CASE WHEN ?<>'' THEN ? ELSE puesto END, firma=COALESCE(?,firma) WHERE id=?',
+              (nombre,dni,dni,puesto,puesto,firma,wid))
+    else:
+        wid=exec1('INSERT INTO trabajadores(empresa_id,apellido_nombre,dni,puesto,firma) VALUES(?,?,?,?,?)',(empresa_id,nombre,dni,puesto,firma))
+    return dict(q('SELECT * FROM trabajadores WHERE id=?',(wid,))[0])
 
 def firma_widget(key):
     st.caption('Firmá dentro del recuadro con el dedo o mouse. La firma se guarda al generar el registro.')
@@ -175,9 +215,10 @@ def _overlay_cap(empresa, fecha, temas, asistentes, instructor):
         c.drawString(x_name,cy,str(a.get('apellido_nombre',''))[:42])
         c.drawString(x_dni,cy,str(a.get('dni',''))[:18])
         c.drawString(x_puesto,cy,str(a.get('puesto',''))[:23])
-        if a.get('firma'):
+        firma_a=_normalizar_firma_bytes(a.get('firma')) if a.get('firma') else None
+        if firma_a:
             try:
-                c.drawImage(ImageReader(io.BytesIO(a['firma'])),455,cy-7,width=92,height=16,preserveAspectRatio=True,anchor='c',mask='auto')
+                c.drawImage(ImageReader(io.BytesIO(firma_a)),455,cy-7,width=92,height=16,preserveAspectRatio=True,anchor='c',mask='auto')
             except Exception:
                 pass
 
@@ -217,8 +258,9 @@ def pdf_epp(empresa,trab,fecha,tarea,items,info=''):
         for xx in cols[1:-1]:c.line(xx,y-rh,xx,y)
         vals=[it['producto'],it['tipo_modelo'],it['marca'],it['certificado'],str(it['cantidad']),fecha]
         for i,v in enumerate(vals):c.drawString(cols[i]+3,y-17,str(v)[:28])
-        if trab.get('firma'):
-            try:c.drawImage(ImageReader(io.BytesIO(trab['firma'])),cols[6]+4,y-rh+3,width=cols[7]-cols[6]-8,height=rh-6,preserveAspectRatio=True,mask='auto')
+        firma_tr=_normalizar_firma_bytes(trab.get('firma')) if trab.get('firma') else None
+        if firma_tr:
+            try:c.drawImage(ImageReader(io.BytesIO(firma_tr)),cols[6]+4,y-rh+3,width=cols[7]-cols[6]-8,height=rh-6,preserveAspectRatio=True,anchor='c',mask='auto')
             except:pass
         y-=rh
     c.setFont('Helvetica-Bold',8);c.drawString(25,max(25,y-15),'Información adicional:');c.setFont('Helvetica',8);c.drawString(120,max(25,y-15),info[:110]);c.save();return b.getvalue()
@@ -243,25 +285,35 @@ with cap:
             eid=ensure_empresa(eid,ed); empd=dict(q('SELECT * FROM empresas WHERE id=?',(eid,))[0]); final=[]
             for a in asistentes:
                 if not a['apellido_nombre'].strip():continue
-                old=q('SELECT * FROM trabajadores WHERE empresa_id=? AND dni=?',(eid,a['dni'])) if a['dni'] else []
-                if old:
-                    wid=old[0]['id']; exec1('UPDATE trabajadores SET apellido_nombre=?,puesto=?,firma=COALESCE(?,firma) WHERE id=?',(a['apellido_nombre'],a['puesto'],a['firma'],wid))
-                else:wid=exec1('INSERT INTO trabajadores(empresa_id,apellido_nombre,dni,puesto,firma) VALUES(?,?,?,?,?)',(eid,a['apellido_nombre'],a['dni'],a['puesto'],a['firma']))
-                aa=dict(a);aa['id']=wid;final.append(aa)
+                # Se guarda en la MISMA tabla que usa EPP y se vuelve a leer desde DB.
+                # Así se reutiliza también una firma anterior cuando el canvas actual quedó vacío.
+                tr_guardado=upsert_trabajador(eid,a['apellido_nombre'],a['dni'],a['puesto'],a['firma'])
+                final.append(tr_guardado)
             alltem=temas+[x.strip() for x in manual.splitlines() if x.strip()];vb=vis.getvalue() if vis else None;pdf=pdf_cap(empd,str(fecha.strftime('%d/%m/%Y')),alltem,final,instructor,vb)
             cid=exec1('INSERT INTO capacitaciones(empresa_id,fecha,tematicas,visado,visado_nombre,pdf) VALUES(?,?,?,?,?,?)',(eid,str(fecha),'; '.join(alltem),vb,vis.name if vis else '',pdf))
             for a in final:exec1('INSERT INTO capacitacion_asistentes(capacitacion_id,trabajador_id) VALUES(?,?)',(cid,a['id']))
-            st.success('Capacitación guardada.');st.download_button('⬇️ Descargar constancia PDF',pdf,f'capacitacion_{fecha}.pdf','application/pdf')
+            st.success('Capacitación guardada. Los asistentes ya quedaron disponibles automáticamente en EPP.');st.download_button('⬇️ Descargar constancia PDF',pdf,f'capacitacion_{fecha}.pdf','application/pdf')
         except Exception as e:st.error(str(e))
 
 with epp:
     eid,ed=empresa_block('epp_'); eid_effective=eid
     if eid_effective:
-        ws=worker_options(eid_effective); names=['➕ Nuevo trabajador']+[w['apellido_nombre'] for w in ws]; sn=st.selectbox('Trabajador',names)
-    else: ws=[];sn='➕ Nuevo trabajador'
+        ws=worker_options(eid_effective)
+        worker_map={f"{w['apellido_nombre']} · DNI {w['dni'] or 's/d'}":dict(w) for w in ws}
+        names=['➕ Nuevo trabajador']+list(worker_map.keys())
+        sn=st.selectbox('Trabajador',names,key='epp_trabajador')
+    else: ws=[];worker_map={};sn='➕ Nuevo trabajador'
     if sn=='➕ Nuevo trabajador':
         c1,c2=st.columns(2);wn=c1.text_input('Apellido y nombre');wd=c2.text_input('DNI');wp=st.text_input('Puesto');wf=firma_widget('epp_new_firma');trab={'apellido_nombre':wn,'dni':wd,'puesto':wp,'firma':wf}
-    else: trab=dict(next(w for w in ws if w['apellido_nombre']==sn));st.caption(f"DNI {trab['dni']} · {trab['puesto']} · se reutilizará la firma guardada")
+    else:
+        trab=worker_map[sn]
+        firma_txt='firma guardada OK' if trab.get('firma') else 'SIN firma guardada'
+        st.caption(f"DNI {trab['dni'] or '—'} · {trab['puesto'] or '—'} · {firma_txt}")
+        if not trab.get('firma'):
+            st.warning('Este trabajador no tiene firma guardada. Podés firmar ahora y la firma quedará disponible también para futuras capacitaciones y entregas.')
+            nueva_firma=firma_widget('epp_existing_firma')
+            if nueva_firma:
+                trab['firma']=nueva_firma
     tareas=['Albañil','Hormigón armado','Pintura','Trabajo en altura','Excavación','Otro']; tarea=st.selectbox('Tarea / puesto para sugerir EPP',tareas); otro=st.text_input('Otro puesto/tarea') if tarea=='Otro' else ''
     mapa=pd.read_csv(DATA/'epp_por_tarea.csv'); suger=mapa[mapa.tarea==tarea].epp.tolist() if tarea!='Otro' else []; eleg=st.multiselect('EPP necesarios / entregados',sorted(set(mapa.epp.tolist())),default=suger); extra=st.text_input('Agregar otro EPP manualmente')
     productos=eleg+([extra.strip()] if extra.strip() else []); rows=[]
@@ -272,11 +324,9 @@ with epp:
     if st.button('💾 Guardar entrega y generar Res. 299/11',type='primary'):
         try:
             eid2=ensure_empresa(eid,ed); empd=dict(q('SELECT * FROM empresas WHERE id=?',(eid2,))[0])
-            if sn=='➕ Nuevo trabajador':
-                if not trab['apellido_nombre'].strip():raise ValueError('Falta nombre del trabajador')
-                wid=exec1('INSERT OR REPLACE INTO trabajadores(id,empresa_id,apellido_nombre,dni,puesto,firma) VALUES((SELECT id FROM trabajadores WHERE empresa_id=? AND dni=?),?,?,?,?,?)',(eid2,trab['dni'],eid2,trab['apellido_nombre'],trab['dni'],trab['puesto'],trab['firma']))
-                tr=dict(q('SELECT * FROM trabajadores WHERE empresa_id=? AND dni=?',(eid2,trab['dni']))[0]) if trab['dni'] else trab; wid=tr.get('id',wid)
-            else:wid=trab['id'];tr=trab
+            # Alta/actualización unificada. Nunca pisa una firma previa con NULL.
+            tr=upsert_trabajador(eid2,trab['apellido_nombre'],trab.get('dni',''),trab.get('puesto',''),trab.get('firma'))
+            wid=tr['id']
             tt=otro.strip() if tarea=='Otro' else tarea;pdf=pdf_epp(empd,tr,str(fe.strftime('%d/%m/%Y')),tt,rows,info);de=exec1('INSERT INTO entregas_epp(empresa_id,trabajador_id,fecha,tarea,info,pdf) VALUES(?,?,?,?,?,?)',(eid2,wid,str(fe),tt,info,pdf))
             for r in rows:exec1('INSERT INTO entrega_items(entrega_id,producto,tipo_modelo,marca,certificado,cantidad) VALUES(?,?,?,?,?,?)',(de,r['producto'],r['tipo_modelo'],r['marca'],r['certificado'],str(r['cantidad'])))
             st.success('Entrega de EPP guardada.');st.download_button('⬇️ Descargar registro EPP PDF',pdf,f'EPP_{tr["apellido_nombre"]}_{fe}.pdf','application/pdf')
@@ -299,6 +349,11 @@ with emp:
     st.subheader('Empresas')
     df=pd.DataFrame([dict(x) for x in empresa_options()]);st.dataframe(df,use_container_width=True,hide_index=True)
     st.caption('Base inicial sincronizada con Gestión Administrativa: 44 clientes migrados. Los clientes ocasionales de capacitación/EPP se mantienen separados.')
+
+    st.markdown('#### Trabajadores compartidos entre Capacitación y EPP')
+    tdf=pd.DataFrame([dict(x) for x in q("SELECT t.id,e.razon_social empresa,t.apellido_nombre,t.dni,t.puesto,CASE WHEN t.firma IS NULL THEN 'NO' ELSE 'SI' END firma_guardada FROM trabajadores t JOIN empresas e ON e.id=t.empresa_id ORDER BY e.razon_social,t.apellido_nombre")])
+    st.dataframe(tdf,use_container_width=True,hide_index=True)
+    st.caption('Esta es una única base: cualquier trabajador cargado en Capacitación aparece en EPP y viceversa.')
 
     st.markdown('---')
     st.subheader('Firmas de instructores')
